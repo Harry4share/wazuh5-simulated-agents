@@ -1,0 +1,205 @@
+# =============================================================================
+# DEMO detection rules -- three, one per platform.
+#
+# Written in the same schema as the stock rules, and matching the same way:
+#   * sudo + command arguments  -> mirrors "Sudo command targeting a persistence
+#     path" (event.action: sudo, process.args|contains)
+#   * account activity          -> mirrors "User added to privileged group"
+#     (event.category|contains: iam)
+#
+# Paste ONE rule at a time into Security Analytics > Detection > Rules > Create,
+# with the space selector on DRAFT. Each is a separate YAML document.
+#
+# I left `compliance:` out on purpose rather than invent framework mappings.
+# If the editor insists on it, copy the block from the stock sudo rule.
+# If it generates its own id, delete the `id:` line.
+#
+# v2: the two sudo rules now match process.command_line. v1 matched
+# process.args, copied from a stock rule, but real sudo events from this decoder
+# carry only process.command_line (process.args does not exist on them), so v1
+# could never fire. Confirmed against live events, not assumed.
+#
+# BEFORE PROMOTING, run each rule's test line through the Wazuh Log test tool
+# and confirm the decoded fields named under it. Promotion looks one-way, so a
+# field that does not match means a rule that saves fine and never fires.
+# =============================================================================
+
+
+# ----------------------------------------------------------------------------
+# 1 of 3 -- LINUX   action to run on ubuntu24:   sudo cat /etc/shadow >/dev/null
+#
+# Log test line (syslog):
+#   Oct  4 14:35:47 sbs sudo[111]:     root : TTY=pts/1 ; PWD=/root ; USER=root ; COMMAND=/usr/bin/cat /etc/shadow
+# Expect in the decoded output:
+#   event.action = sudo
+#   process.command_line = /usr/bin/cat /etc/shadow
+# ----------------------------------------------------------------------------
+id: 7dc03447-be16-5e78-b6a2-91fb24208037
+logsource:
+  product: process
+tags:
+  - attack.credential-access
+  - attack.t1003
+  - attack.t1003.008
+falsepositives:
+  - Authorised administrators or backup tooling reading the shadow file through sudo
+level: high
+status: stable
+enabled: true
+detection:
+  condition: selection
+  selection:
+    event.action: sudo
+    process.command_line|contains:
+      - /etc/shadow
+metadata:
+  title: DEMO - Shadow file read via sudo
+  author: Demo environment
+  description: >
+    Detects a sudo-elevated command whose arguments reference /etc/shadow, the
+    file that holds local password hashes. Reading it as root is a common step
+    in credential dumping.
+  references:
+    - https://attack.mitre.org/techniques/T1003/008/
+  documentation: ''
+  supports:
+    - ''
+  modified: '2026-10-04'
+mitre:
+  subtechnique:
+    id:
+      - T1003.008
+    name:
+      - /etc/passwd and /etc/shadow
+  tactic:
+    id:
+      - TA0006
+    name:
+      - Credential Access
+  technique:
+    id:
+      - T1003
+    name:
+      - OS Credential Dumping
+---
+
+# ----------------------------------------------------------------------------
+# 2 of 3 -- macOS   action to run on the Mac VM (021):
+#                   sudo security find-generic-password -ga demo-item
+#                   (prints "could not be found"; no real secret is touched)
+#
+# Log test line (macOS unified log):
+#   2026-10-04 20:05:47.220540+0530  mac.local sudo[333]:  jlee : TTY=ttys000 ; PWD=/Users/jlee ; USER=root ; COMMAND=/usr/bin/security find-generic-password -ga demo-item
+# Expect in the decoded output:
+#   event.action = sudo
+#   process.command_line = /usr/bin/security find-generic-password -ga demo-item
+# ----------------------------------------------------------------------------
+id: b7e5d938-cd9e-59f9-b387-f50f8846f0af
+logsource:
+  product: process
+tags:
+  - attack.credential-access
+  - attack.t1555
+  - attack.t1555.001
+falsepositives:
+  - Authorised scripts or administrators reading keychain items through sudo
+level: high
+status: stable
+enabled: true
+detection:
+  condition: selection
+  selection:
+    event.action: sudo
+    process.command_line|contains:
+      - find-generic-password
+      - find-internet-password
+      - dump-keychain
+metadata:
+  title: DEMO - Keychain secret read via sudo
+  author: Demo environment
+  description: >
+    Detects a sudo-elevated use of the macOS security tool to read, or dump,
+    keychain items. Pulling stored credentials as root is a common credential
+    access technique on macOS.
+  references:
+    - https://attack.mitre.org/techniques/T1555/001/
+  documentation: ''
+  supports:
+    - ''
+  modified: '2026-10-04'
+mitre:
+  subtechnique:
+    id:
+      - T1555.001
+    name:
+      - Keychain
+  tactic:
+    id:
+      - TA0006
+    name:
+      - Credential Access
+  technique:
+    id:
+      - T1555
+    name:
+      - Credentials from Password Stores
+---
+
+# ----------------------------------------------------------------------------
+# 3 of 3 -- WINDOWS   action to run in an ELEVATED prompt on win11:
+#                       net user demotest "Passw0rd!2026" /add
+#                     then straight away:
+#                       net user demotest /delete
+#
+# Log test line (Windows EventChannel, event 4720, account created):
+#   <Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4720</EventID><Version>0</Version><Level>0</Level><Task>13824</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime='2026-10-04T15:00:00.0000000Z'/><EventRecordID>1000000000</EventRecordID><Correlation/><Execution ProcessID='1408' ThreadID='2582'/><Channel>Security</Channel><Computer>WIN11</Computer><Security/></System><EventData><Data Name='TargetUserName'>demotest</Data><Data Name='TargetDomainName'>CORP</Data><Data Name='TargetSid'>S-1-5-21-780672331-3256254420-2915116740-2970</Data><Data Name='SubjectUserSid'>S-1-5-18</Data><Data Name='SubjectUserName'>Administrator</Data><Data Name='SubjectDomainName'>CORP</Data><Data Name='SubjectLogonId'>0x369e0d</Data><Data Name='PrivilegeList'>-</Data><Data Name='SamAccountName'>svc_temp</Data></EventData></Event>
+# Expect in the decoded output:
+#   event.code = 4720
+#   event.action = user-created      <-- CHECK: if the decoder uses another value,
+#   event.category contains iam          change that one line below to match
+# ----------------------------------------------------------------------------
+id: b5b54334-a7ad-508d-8846-7bfc93b13dac
+logsource:
+  product: iam
+tags:
+  - attack.persistence
+  - attack.t1136
+  - attack.t1136.001
+falsepositives:
+  - Legitimate account provisioning by IT administrators
+level: medium
+status: stable
+enabled: true
+detection:
+  condition: selection
+  selection:
+    event.action: user-created    # <-- CHECK
+    event.category|contains: iam
+metadata:
+  title: DEMO - User account created
+  author: Demo environment
+  description: >
+    Detects creation of a user account. Outside of normal provisioning this can
+    indicate an attacker establishing persistence with a new local account.
+  references:
+    - https://attack.mitre.org/techniques/T1136/001/
+  documentation: ''
+  supports:
+    - ''
+  modified: '2026-10-04'
+mitre:
+  subtechnique:
+    id:
+      - T1136.001
+    name:
+      - Local Account
+  tactic:
+    id:
+      - TA0003
+    name:
+      - Persistence
+  technique:
+    id:
+      - T1136
+    name:
+      - Create Account

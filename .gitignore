@@ -1,0 +1,34 @@
+# Secrets and credentials
+indexer.env
+demo.conf
+authd.pass
+agents/
+.env
+*.pem
+*.key
+# Recorded data: real hostnames, users, IPs, paths and log lines. Share it as a bundle (./democtl export), not in git
+fixtures/
+fixtures.bak-*/
+events/
+events.old/
+activity.json
+*.tar.gz
+*.tgz
+# Runtime
+run/
+logs/
+__pycache__/
+*.pyc
+*.log
+*.pid
+venv/
+.venv/
+# Editor and OS
+.DS_Store
+*.swp
+# Editor, OS and backups
+*.bak
+*.bak.*
+*.orig
+*.old
+*~

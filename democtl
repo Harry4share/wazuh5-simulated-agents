@@ -1,0 +1,1318 @@
+#!/usr/bin/env bash
+#
+# democtl — one command to run the whole simulated-agent demo environment.
+#
+#   ./democtl setup     create config files, check connectivity, record fixtures
+#   ./democtl start     start every agent, the inventory replay and the automatic events
+#   ./democtl stop      stop everything (agents marked disconnected cleanly)
+#   ./democtl restart   stop then start
+#   ./democtl status    what's running, plus what the manager and indexer say
+#   ./democtl logs      tail all logs together
+#   ./democtl enroll    enroll any agent in demo.conf that has no state file yet
+#   ./democtl purge     remove replayed documents from the indexer
+#   ./democtl install   install + enable the systemd unit (needs sudo)
+#   ./democtl uninstall remove the systemd unit (needs sudo)
+#   ./democtl reload                   re-read fixtures/ and restart the inventory replay
+#   ./democtl fim <agent>              raise a File Integrity alert for one agent
+#   ./democtl events <agent> <scenario>  send one event scenario to one agent
+#     scenarios: ambient security-alerts brute-force privilege-escalation
+#                session-activity fim-changes rule:<text>
+#   ./democtl agent add <name> <macos|windows|linux> <ip> [--source ID]   enroll (+ map)
+#   ./democtl agent list                                    show configured agents
+#   ./democtl agent remove <name>                           deregister and delete
+#   ./democtl agent sources                                 what was recorded, per source
+#   ./democtl agent map <name> <source-id>                  give an agent that data
+#   ./democtl export [file.tar.gz]     bundle fixtures + events for another host
+#   ./democtl import <file.tar.gz>     bring in a bundle from ./democtl export
+#     (agent credentials never travel — the target host always re-enrolls)
+#
+# Everything is configured in demo.conf, which sits beside this script.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONF="${HERE}/demo.conf"
+RUN="${HERE}/run"
+LOGS="${HERE}/logs"
+STATE="${HERE}/agents"
+
+# ---------------------------------------------------------------- colours ---
+if [ -t 1 ]; then
+    R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[1m'; N=$'\e[0m'
+else
+    R=''; G=''; Y=''; B=''; N=''
+fi
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$R" "$N" "$*"; }
+warn() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
+head_() { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
+
+die() { printf '%sERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+# ----------------------------------------------------------------- config ---
+if [ -f "$CONF" ]; then
+    # shellcheck disable=SC1090
+    source "$CONF"
+elif [ -n "${1:-}" ] && [[ ! "${1}" =~ ^(setup|install|uninstall)$ ]]; then
+    if [ "${1}" = "import" ]; then
+        die "No config at $CONF.
+    Run these two commands, in order:
+      ./democtl setup            # creates demo.conf for THIS environment
+      ./democtl import ${2:-<bundle.tar.gz>}"
+    fi
+    die "No config at $CONF. Run: ./democtl setup"
+fi
+
+# AGENTS is legitimately empty in a fresh environment (before the first `agent add`) or right
+# after `import`, so no command requires it; only the manager address is mandatory.
+if [ -n "${1:-}" ] && [[ ! "${1}" =~ ^(setup|install|uninstall|import|export|agent)$ ]]; then
+    : "${MANAGER:?MANAGER not set in demo.conf}"
+fi
+MANAGER="${MANAGER:-}"
+AGENTS="${AGENTS:-}"
+PYTHON="${PYTHON:-python3}"
+REPLAY_INTERVAL="${REPLAY_INTERVAL:-300}"
+UI_PORT="${UI_PORT:-8088}"
+UI_BIND="${UI_BIND:-0.0.0.0}"
+AUTO_EVENTS="${AUTO_EVENTS:-yes}"
+AUTO_EVENTS_LEVEL="${AUTO_EVENTS_LEVEL:-normal}"
+ENROLL_PASS_FILE="${ENROLL_PASS_FILE:-/var/wazuh-manager/etc/authd.pass}"
+UI_ENABLED="${UI_ENABLED:-yes}"
+INCLUDE_FIM="${INCLUDE_FIM:-no}"
+
+mkdir -p "$RUN" "$LOGS" "$STATE"
+
+# Indexer credentials for the replay process.
+if [ -f "${HERE}/indexer.env" ]; then
+    set -a; # shellcheck disable=SC1091
+    source "${HERE}/indexer.env"; set +a
+fi
+
+# The replay needs these; without them it fails several steps later with an
+# argparse error that doesn't say what's actually missing.
+have_indexer_creds() {
+    [ -n "${WAZUH_INDEXER_URL:-}" ] && [ -n "${WAZUH_INDEXER_PASS:-}" ]
+}
+
+# --------------------------------------------------------------- helpers ---
+# AGENTS entries are "name:profile:ip"
+agent_names()   { for a in $AGENTS; do echo "${a%%:*}"; done; }
+agent_profile() { local a=$1; a=${a#*:}; echo "${a%%:*}"; }
+agent_ip()      { echo "${1##*:}"; }
+
+pidfile() { echo "${RUN}/$1.pid"; }
+
+port_busy() {
+    # Pure bash: no dependency on ss/netstat/lsof. If something accepts a
+    # connection on the port, it is busy.
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3<&-; return 0; }
+    return 1
+}
+
+is_running() {
+    local pf; pf=$(pidfile "$1")
+    [ -f "$pf" ] || return 1
+    local pid; pid=$(cat "$pf" 2>/dev/null) || return 1
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start_proc() {  # name, then command...
+    local name=$1; shift
+    if is_running "$name"; then
+        warn "$name already running (pid $(cat "$(pidfile "$name")"))"
+        return 0
+    fi
+    # PYTHONUNBUFFERED: without it Python block-buffers stdout when redirected
+    # to a file, so log lines don't appear until ~4 KB has accumulated.
+    echo "=== started $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >>"${LOGS}/${name}.log"
+    PYTHONUNBUFFERED=1 nohup "$@" >>"${LOGS}/${name}.log" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$(pidfile "$name")"
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+        ok "$name started (pid $pid)"
+    else
+        bad "$name failed to start — see ${LOGS}/${name}.log"
+        tail -3 "${LOGS}/${name}.log" | sed 's/^/      /'
+        rm -f "$(pidfile "$name")"
+        return 1
+    fi
+}
+
+stop_proc() {
+    local name=$1
+    if ! is_running "$name"; then
+        rm -f "$(pidfile "$name")"
+        return 0
+    fi
+    local pid; pid=$(cat "$(pidfile "$name")")
+    kill "$pid" 2>/dev/null
+    for _ in $(seq 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    kill -9 "$pid" 2>/dev/null
+    rm -f "$(pidfile "$name")"
+    ok "$name stopped"
+}
+
+# ---------------------------------------------------------------- actions ---
+cmd_setup() {
+    head_ "Setup"
+
+    # --- demo.conf ---
+    if [ -f "$CONF" ]; then
+        ok "demo.conf exists"
+    else
+        [ -f "${HERE}/demo.conf.example" ] || die "demo.conf.example missing"
+        cp "${HERE}/demo.conf.example" "$CONF"
+        chmod 600 "$CONF"
+        ok "created demo.conf from the example"
+        local mgr
+        read -rp "  Manager IP or hostname (what agents connect to): " mgr
+        [ -n "$mgr" ] || { rm -f "$CONF"; die "the manager address is required"; }
+        sed -i "s|^MANAGER=.*|MANAGER=${mgr}|" "$CONF"
+        ok "MANAGER=${mgr}"
+
+        # Enrolment needs the manager's shared password. On the manager host it is readable
+        # in place; anywhere else, a copy has to be brought over.
+        if [ ! -r /var/wazuh-manager/etc/authd.pass ]; then
+            echo "  This host cannot read the manager's enrolment password."
+            echo "  Copy /var/wazuh-manager/etc/authd.pass from the manager to this host"
+            echo "  (mode 600), then give the path of the copy."
+            local epf
+            read -rp "  Path to the copy [${HERE}/authd.pass]: " epf
+            epf=${epf:-${HERE}/authd.pass}
+            sed -i "s|^ENROLL_PASS_FILE=.*|ENROLL_PASS_FILE=${epf}|" "$CONF"
+            ok "ENROLL_PASS_FILE=${epf}"
+        fi
+    fi
+
+    # --- indexer.env ---
+    if [ -f "${HERE}/indexer.env" ]; then
+        ok "indexer.env exists"
+    else
+        local iurl iuser ipass
+        read -rp "  Indexer URL [https://127.0.0.1:9200]: " iurl
+        iurl=${iurl:-https://127.0.0.1:9200}
+        read -rp "  Indexer user [admin]: " iuser
+        iuser=${iuser:-admin}
+        read -rsp "  Indexer password: " ipass; echo
+        [ -n "$ipass" ] || die "indexer password is required"
+        umask 077
+        cat > "${HERE}/indexer.env" <<EOF
+WAZUH_INDEXER_URL=${iurl}
+WAZUH_INDEXER_USER=${iuser}
+WAZUH_INDEXER_PASS=${ipass}
+EOF
+        chmod 600 "${HERE}/indexer.env"
+        set -a; # shellcheck disable=SC1091
+        source "${HERE}/indexer.env"; set +a
+        ok "created indexer.env (mode 600)"
+    fi
+
+    # --- UI credentials ---
+    if ! grep -q '^UI_PASS=.\+' "$CONF" 2>/dev/null; then
+        head_ "Web UI"
+        echo "  The UI starts with the environment and is reachable on the network."
+        echo "  It can enrol agents, stop processes and delete data."
+        local uipass
+        read -rsp "  Password for the UI (blank = no authentication): " uipass; echo
+        if [ -n "$uipass" ]; then
+            sed -i "s|^UI_PASS=.*|UI_PASS=${uipass}|" "$CONF" 2>/dev/null \
+              || echo "UI_PASS=${uipass}" >> "$CONF"
+            grep -q '^UI_USER=' "$CONF" || echo "UI_USER=demo" >> "$CONF"
+            ok "authentication enabled (user demo)"
+        else
+            warn "no authentication; consider UI_BIND=127.0.0.1 in demo.conf"
+        fi
+    fi
+
+    # --- connectivity ---
+    head_ "Checking connectivity"
+    # demo.conf was written moments ago by this same setup run, but the shell
+    # variables in THIS process are whatever was in scope when the script
+    # started -- empty, on a first run, since the file did not exist yet at
+    # the top-of-script source. Re-source now so MANAGER, WAZUH_INDEXER_URL
+    # etc. reflect what was actually just written.
+    # shellcheck disable=SC1090
+    source "$CONF"
+    set -a
+    # shellcheck disable=SC1090
+    [ -f "${HERE}/indexer.env" ] && source "${HERE}/indexer.env"
+    set +a
+
+    if curl -sk -u "${WAZUH_INDEXER_USER:-admin}:${WAZUH_INDEXER_PASS:-}" \
+         "${WAZUH_INDEXER_URL:-}" 2>/dev/null | grep -q cluster_name; then
+        ok "indexer reachable"
+    else
+        bad "cannot reach the indexer — check indexer.env"
+        echo "      Port 9200 usually binds loopback: use https://127.0.0.1:9200"
+        return 1
+    fi
+
+    if [ -z "${MANAGER:-}" ]; then
+        bad "MANAGER is empty after re-reading demo.conf — check the file directly"
+        return 1
+    fi
+    if curl -sk --connect-timeout 5 "https://${MANAGER}:1517/wazuh-manager/" 2>/dev/null \
+         | grep -q remoted; then
+        ok "manager remoted reachable on 1517"
+    else
+        bad "cannot reach the manager on ${MANAGER}:1517"
+        return 1
+    fi
+
+    if [ -r "${ENROLL_PASS_FILE:-/var/wazuh-manager/etc/authd.pass}" ]; then
+        ok "enrollment password readable (${ENROLL_PASS_FILE:-/var/wazuh-manager/etc/authd.pass})"
+    else
+        warn "cannot read ${ENROLL_PASS_FILE:-/var/wazuh-manager/etc/authd.pass}"
+        echo "      Agents cannot enrol without it. Run as root on the manager host, or copy the"
+        echo "      file from the manager and set ENROLL_PASS_FILE in demo.conf."
+    fi
+
+    # --- python modules ---
+    head_ "Python modules"
+    "$PYTHON" -c 'import requests' 2>/dev/null \
+        && ok "requests" || bad "requests missing: pip install -r requirements.txt"
+    "$PYTHON" -c 'import flatbuffers' 2>/dev/null \
+        && ok "flatbuffers" \
+        || warn "flatbuffers missing: file-integrity state cannot be sent (pip install -r requirements.txt)"
+
+    # --- fixtures ---
+    head_ "Fixtures"
+    if [ -d "${HERE}/fixtures/docs" ] && \
+       [ -n "$(ls -A "${HERE}/fixtures/docs" 2>/dev/null)" ]; then
+        ok "fixtures present ($(ls "${HERE}/fixtures/docs" | wc -l) indices)"
+    else
+        warn "no fixtures yet — inventory panels will be empty"
+        local a
+        read -rp "  Record fixtures from the live agents now? [y/N] " a
+        if [ "$a" = y ]; then
+            "$PYTHON" "${HERE}/wazuh_fixture_recorder.py" --outdir "${HERE}/fixtures" \
+              || { bad "recording failed"; return 1; }
+            ok "fixtures recorded"
+            warn "set FIXTURE_AGENTS and REMAP in demo.conf before starting the replay"
+        else
+            echo "      Later: $PYTHON wazuh_fixture_recorder.py --outdir ./fixtures"
+        fi
+    fi
+
+    head_ "Next"
+    echo "  1. review demo.conf (agents, FIXTURE_AGENTS, REMAP, API_PASS)"
+    echo "  2. ./democtl start"
+    echo "  3. ./democtl status   — note the assigned IDs, then set REMAP to match"
+}
+
+cmd_install() {
+    head_ "Installing systemd unit"
+    [ "$(id -u)" = 0 ] || die "run as root: sudo ./democtl install"
+
+    local unit=/etc/systemd/system/wazuh-sim.service
+    cat > "$unit" <<EOF
+[Unit]
+Description=Wazuh simulated agent environment
+Documentation=file://${HERE}/RUNBOOK.md
+After=network-online.target wazuh-manager.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${HERE}
+ExecStart=${HERE}/democtl start
+ExecStop=${HERE}/democtl stop
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ok "wrote $unit"
+
+    systemctl daemon-reload && ok "systemd reloaded"
+    systemctl enable wazuh-sim >/dev/null 2>&1 && ok "enabled at boot"
+
+    head_ "Next"
+    echo "  sudo systemctl start wazuh-sim"
+    echo "  sudo systemctl status wazuh-sim"
+    echo "  ./democtl status        # the detailed view"
+    echo
+    echo "  Note: this unit starts and stops the whole environment. It does not"
+    echo "  restart individual processes that die — ./democtl status will show"
+    echo "  fewer than 4/4 up if one has. Re-run 'systemctl restart wazuh-sim'."
+}
+
+cmd_uninstall() {
+    head_ "Removing systemd unit"
+    [ "$(id -u)" = 0 ] || die "run as root: sudo ./democtl uninstall"
+    systemctl disable --now wazuh-sim >/dev/null 2>&1 && ok "disabled and stopped"
+    rm -f /etc/systemd/system/wazuh-sim.service && ok "unit removed"
+    systemctl daemon-reload && ok "systemd reloaded"
+    echo "  Config, fixtures and agent keys were left in place."
+}
+
+cmd_enroll() {
+    head_ "Enrolling agents without a state file"
+    local any=0
+    for entry in $AGENTS; do
+        local name profile ip
+        name=${entry%%:*}
+        profile=$(agent_profile "$entry")
+        ip=$(agent_ip "$entry")
+        if [ -f "${STATE}/${name}.json" ]; then
+            ok "$name already enrolled (agent $(grep -o '"id"[^,]*' "${STATE}/${name}.json" | cut -d'"' -f4))"
+            continue
+        fi
+        any=1
+        printf '  enrolling %s (%s)...\n' "$name" "$profile"
+        if "$PYTHON" "${HERE}/wazuh_agent_sim.py" \
+              --manager "$MANAGER" --profile "$profile" \
+              --name "$name" --reported-ip "$ip" \
+              --password-file "$ENROLL_PASS_FILE" \
+              --state "${STATE}/${name}.json" --once >>"${LOGS}/enroll.log" 2>&1; then
+            ok "$name enrolled"
+        else
+            bad "$name enrollment failed — see ${LOGS}/enroll.log"
+            tail -3 "${LOGS}/enroll.log" | sed 's/^/      /'
+        fi
+    done
+    [ "$any" = 0 ] && echo "  nothing to do"
+    return 0
+}
+
+start_replay() {
+    if [ -z "${FIXTURE_AGENTS:-}" ]; then
+        warn "FIXTURE_AGENTS empty in demo.conf — replay not started"
+    elif [ ! -d "${HERE}/fixtures/docs" ]; then
+        warn "no fixtures found — run ./democtl setup"
+    elif ! have_indexer_creds; then
+        bad "no indexer credentials — replay not started"
+        echo "      Create ${HERE}/indexer.env with:"
+        echo "        WAZUH_INDEXER_URL=https://127.0.0.1:9200"
+        echo "        WAZUH_INDEXER_USER=admin"
+        echo "        WAZUH_INDEXER_PASS=..."
+        echo "      or just run: ./democtl setup"
+    else
+        # shellcheck disable=SC2086
+        start_proc replay "$PYTHON" "${HERE}/wazuh_fixture_player.py" \
+            --fixtures "${HERE}/fixtures" \
+            --agents ${FIXTURE_AGENTS} \
+            ${REMAP:+--remap} ${REMAP:-} \
+            ${INCLUDE_FIM:+$([ "$INCLUDE_FIM" = "yes" ] && echo --include-fim)} \
+            --loop "$REPLAY_INTERVAL"
+    fi
+}
+
+cmd_start() {
+    cmd_enroll
+
+    head_ "Starting keepalives"
+    for entry in $AGENTS; do
+        local name profile ip
+        name=${entry%%:*}
+        profile=$(agent_profile "$entry")
+        ip=$(agent_ip "$entry")
+        [ -f "${STATE}/${name}.json" ] || { bad "$name has no state file, skipping"; continue; }
+        # An identity file (written by `agent map`) makes the agent report the machine its
+        # inventory came from, instead of the built-in profile.
+        local ident=()
+        [ -f "${STATE}/${name}.identity" ] && ident=(--identity "${STATE}/${name}.identity")
+        start_proc "$name" "$PYTHON" "${HERE}/wazuh_agent_sim.py" \
+            --manager "$MANAGER" --profile "$profile" --reported-ip "$ip" \
+            --state "${STATE}/${name}.json" ${ident[@]+"${ident[@]}"}
+    done
+
+    head_ "Starting inventory replay"
+    start_replay
+
+    if [ "${AUTO_EVENTS}" = "yes" ]; then
+        head_ "Starting automatic events"
+        echo "  Keeps recent alerts flowing so the dashboard is never empty (AUTO_EVENTS in demo.conf)."
+        start_proc autoevents "$PYTHON" "${HERE}/wazuh_autoevents.py"
+    else
+        head_ "Automatic events"
+        warn "AUTO_EVENTS=no: replayed events age out of the dashboard's 24-hour window unless you send them"
+    fi
+
+    if [ "$UI_ENABLED" = "yes" ]; then
+        head_ "Starting web UI"
+        # A UI started by hand keeps the port, so the managed one cannot bind.
+        # Detect that specifically rather than reporting a generic failure.
+        if ! is_running ui && port_busy "$UI_PORT"; then
+            bad "port ${UI_PORT} is already in use"
+            echo "      Another UI is probably running outside democtl:"
+            echo "        pkill -f wazuh_sim_ui && ./democtl start"
+        elif start_proc ui "$PYTHON" "${HERE}/wazuh_sim_ui.py" \
+                 --port "$UI_PORT" --bind "$UI_BIND"; then
+            if [ -n "${UI_USER:-}" ] && [ -n "${UI_PASS:-}" ]; then
+                ok "http://${UI_BIND}:${UI_PORT}/  (login: ${UI_USER})"
+            else
+                ok "http://${UI_BIND}:${UI_PORT}/"
+                if [ "$UI_BIND" != "127.0.0.1" ]; then
+                    warn "no authentication — set UI_USER and UI_PASS in demo.conf"
+                fi
+            fi
+        fi
+    fi
+
+    head_ "Done"
+    echo "  agents take up to a minute to show active. ./democtl status to check."
+}
+
+cmd_reload() {
+    head_ "Reloading the inventory replay"
+    echo "  The replay reads fixtures/ and demo.conf once, when it starts."
+    # shellcheck disable=SC1090
+    source "$CONF"
+    stop_proc replay
+    start_replay
+}
+
+cmd_stop() {
+    head_ "Stopping automatic events"
+    stop_proc autoevents
+
+    head_ "Stopping web UI"
+    stop_proc ui
+
+    head_ "Stopping inventory replay"
+    stop_proc replay
+
+    head_ "Stopping keepalives"
+    for name in $(agent_names); do
+        stop_proc "$name"
+    done
+
+    if [ "${CLEAN_SHUTDOWN:-yes}" = "yes" ]; then
+        head_ "Marking agents disconnected"
+        for name in $(agent_names); do
+            [ -f "${STATE}/${name}.json" ] || continue
+            if "$PYTHON" "${HERE}/wazuh_agent_sim.py" --manager "$MANAGER" \
+                  --state "${STATE}/${name}.json" --shutdown >/dev/null 2>&1; then
+                ok "$name marked disconnected"
+            else
+                warn "$name shutdown call failed (it will time out on its own)"
+            fi
+        done
+    fi
+}
+
+cmd_status() {
+    local json
+    json=$("$PYTHON" "${HERE}/wazuh_sim_ui.py" --dump-state 2>&1)
+    if ! printf '%s' "$json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+        bad "could not read state (is demo.conf present? does wazuh_sim_ui.py run here?)"
+        printf '%s\n' "$json" | sed 's/^/  /'
+        return 1
+    fi
+
+    # Everything below is rendered from the SAME JSON the web dashboard's
+    # /api/state serves, via build_state() in wazuh_sim_ui.py -- the CLI and
+    # the dashboard are backed by one function, so they cannot disagree about
+    # what they report.
+    #
+    # `python3 - <<PYEOF` reads the heredoc ITSELF as the script's stdin
+    # (that's what `-` as the script path means), so the JSON cannot also be
+    # piped over stdin -- the two collide and the script never sees real
+    # data. A temp file passed as argv[1] sidesteps that.
+    local statefile; statefile=$(mktemp)
+    printf '%s' "$json" > "$statefile"
+    "$PYTHON" - "$statefile" <<'PYEOF'
+import json, sys
+
+BOLD, DIM, GREEN, RED, YEL, RST = (
+    "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m")
+
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+
+
+def hdr(t):
+    print(f"\n{BOLD}{t}{RST}\n" + "-" * len(t))
+
+
+def mark(ok):
+    return f"{GREEN}\u2713{RST}" if ok else f"{RED}\u2717{RST}"
+
+
+def age(iso):
+    if not iso:
+        return "-"
+    from datetime import datetime, timezone
+    try:
+        t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso
+    s = (datetime.now(timezone.utc) - t).total_seconds()
+    if s < 0 or s != s:
+        return "-"
+    if s < 60:
+        return f"{int(s)}s ago"
+    if s < 3600:
+        return f"{int(s/60)}m ago"
+    return f"{int(s/3600)}h ago"
+
+
+hdr("Processes")
+procs = [(a["name"], a["pid"]) for a in d["agents"]] + \
+        [("replay", d["replay"]["pid"])]
+up = sum(1 for _, pid in procs if pid)
+for name, pid in procs:
+    print(f"  {mark(pid)} {name}" + (f" (pid {pid})" if pid else " not running"))
+print(f"  {up}/{len(procs)} up")
+
+hdr("Simulated agents")
+for a in d["agents"]:
+    live = a["status"] == "active" and a["pid"]
+    status = a["status"] or ("starting" if a["pid"] else "stopped")
+    pkgs = "-" if a["packages"] is None else f'{a["packages"]} pkgs'
+    src = a["remap_source"] or f"{YEL}unmapped{RST}"
+    ev = "-" if a["events_recent"] is None else f'{a["events_recent"]} events (15m)'
+    print(f"  {mark(live)} {a['name']:<16} id={a['id'] or '-':<5} "
+          f"{a['profile']:<8} {status:<13} {age(a['last_seen']):<10} "
+          f"inv={pkgs:<12} from={src:<10} activity={ev}")
+
+if d["real"]:
+    hdr("Real agents (not managed here)")
+    for a in d["real"]:
+        live = a["status"] == "active"
+        print(f"  {mark(live)} {a['id']:<5} {a.get('name','?'):<16} "
+              f"{a.get('os') or '-':<28} {a['status']:<13} {age(a['last_seen'])}")
+
+hdr("Data")
+print(f"  fixtures recorded : {mark(d['has_fixtures'])}")
+print(f"  log corpus groups : {len(d['corpus'])}"
+      + (f" ({sum(d['corpus'].values())} lines)" if d["corpus"] else ""))
+print(f"  FIM change docs   : {d['fim_count']}")
+print(f"  inventory replay  : {mark(bool(d['replay']['pid']))}"
+      + (" running" if d["replay"]["pid"] else " stopped"))
+if d["manager_reachable"]:
+    print(f"  manager API       : {mark(True)} ({d['manager']})")
+else:
+    print(f"  manager API       : {mark(False)} could not reach {d['manager']}")
+
+# The same checks renderHealth() runs in the dashboard, so a problem visible
+# in the browser is visible here too.
+issues = []
+if not d["has_fixtures"]:
+    issues.append("No inventory fixtures recorded. Record them from the "
+                  "UI's Data panel, or run wazuh_fixture_recorder.py.")
+unmapped = [a["name"] for a in d["agents"] if a["enrolled"] and not a["remap_source"]]
+if unmapped:
+    issues.append(f"No inventory source for: {', '.join(unmapped)}. "
+                   f"They show active with empty IT Hygiene.")
+sources = d.get("fixture_sources") or {}
+stale = [a["name"] for a in d["agents"]
+         if a["remap_source"] and a["remap_source"] not in sources]
+if stale:
+    issues.append(f"Inventory source no longer exists for: {', '.join(stale)} "
+                  f"(likely re-enrolled). Re-map it.")
+stopped = [a["name"] for a in d["agents"] if a["enrolled"] and not a["pid"]]
+if stopped:
+    issues.append(f"Keepalive stopped for: {', '.join(stopped)}. "
+                  f"They will go disconnected within a few minutes.")
+if not d["replay"]["pid"] and d["has_fixtures"]:
+    issues.append("Inventory replay is stopped. Scan timestamps will go stale.")
+if not d["corpus"]:
+    issues.append("No log lines harvested \u2014 no events or alerts can be produced.")
+
+if issues:
+    hdr(f"{YEL}Needs attention{RST}")
+    for i in issues:
+        print(f"  \u2022 {i}")
+print()
+PYEOF
+    rm -f "$statefile"
+    "$PYTHON" "${HERE}/wazuh_autoevents.py" --status 2>/dev/null || true
+}
+
+cmd_logs() {
+    local files=()
+    for name in $(agent_names) replay ui; do
+        [ -f "${LOGS}/${name}.log" ] && files+=("${LOGS}/${name}.log")
+    done
+    [ ${#files[@]} -eq 0 ] && die "no logs yet"
+    tail -n 20 -f "${files[@]}"
+}
+
+cmd_purge() {
+    head_ "Removing replayed documents"
+    [ -n "${FIXTURE_AGENTS:-}" ] || die "FIXTURE_AGENTS not set"
+    read -rp "  Delete replayed inventory for agents [${FIXTURE_AGENTS}]? [y/N] " a
+    [ "$a" = y ] || { echo "  cancelled"; return 0; }
+    # shellcheck disable=SC2086
+    "$PYTHON" "${HERE}/wazuh_fixture_player.py" \
+        --fixtures "${HERE}/fixtures" \
+        --agents ${FIXTURE_AGENTS} \
+        ${REMAP:+--remap} ${REMAP:-} \
+        --purge
+}
+
+cmd_fim() {
+    local name=$1
+    [ -n "$name" ] || die "usage: ./democtl fim <agent-name>"
+
+    local spec entry profile
+    entry=$(printf '%s\n' $AGENTS | grep "^${name}:")
+    [ -n "$entry" ] || die "no such agent '$name' in demo.conf"
+    profile=$(echo "$entry" | cut -d: -f2)
+    [ -f "${STATE}/${name}.json" ] || die "$name is not enrolled — run ./democtl start first"
+
+    head_ "FIM baseline"
+    # FIM state documents live in whichever of these was harvested into.
+    # fixtures/ is the inventory recorder's output; events/ is the log
+    # harvester's. Try the one that actually has FIM material without
+    # printing the first attempt's failure when it is expected.
+    local src="${HERE}/events"
+    [ -d "${HERE}/fixtures/events" ] && src="${HERE}/fixtures"
+    "$PYTHON" "${HERE}/wazuh_stateful_player.py" \
+        --manager "$MANAGER" --state "${STATE}/${name}.json" \
+        --events "$src" --profile "$profile" \
+        --module fim --count 5 --once
+
+    head_ "FIM change event"
+    "$PYTHON" "${HERE}/wazuh_event_player.py" \
+        --manager "$MANAGER" --state "${STATE}/${name}.json" \
+        --events "${HERE}/events" --profile "$profile" --name "$name" \
+        --scenario fim-changes --fim-count 5 --once
+
+    echo
+    ok "sent — check Threat Hunting / Findings for '${name}' in 2-3 minutes"
+}
+
+cmd_agent() {
+    local action=$1; shift || true
+    case "$action" in
+        add)    cmd_agent_add "$@" ;;
+        list)   cmd_agent_list ;;
+        remove) cmd_agent_remove "$1" ;;
+        sources) cmd_agent_sources ;;
+        map)    cmd_agent_map "$@" ;;
+        *) die "usage: ./democtl agent <add|list|remove|sources|map> ...
+    ./democtl agent add <name> <macos|windows|linux> <reported-ip> [--source ID] [--hostname H]
+    ./democtl agent list
+    ./democtl agent remove <name>
+    ./democtl agent sources
+    ./democtl agent map <name> <source-id> [--hostname H] [--force]" ;;
+    esac
+}
+
+default_hostname() {
+    case "$1" in
+        windows) echo "WIN-DEMO" ;;
+        macos)   echo "MAC-demo-MacBook-Air.local" ;;
+        *)       echo "amazonlinux-demo" ;;
+    esac
+}
+
+cmd_agent_add() {
+    local name=${1:-} profile=${2:-} ip=${3:-} source="" hostname=""
+    [ -n "$name" ] && [ -n "$profile" ] && [ -n "$ip" ] \
+        || die "usage: ./democtl agent add <name> <macos|windows|linux> <reported-ip> [--source ID] [--hostname H]"
+    shift 3
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --source)   source=${2:-}; shift ;;
+            --hostname) hostname=${2:-}; shift ;;
+            *) die "unknown option '$1'" ;;
+        esac
+        shift
+    done
+    case "$profile" in macos|windows|linux) ;; *) die "profile must be macos, windows or linux" ;; esac
+    [[ "$name" =~ ^[A-Za-z0-9._-]{1,48}$ ]] || die "name: letters, digits, . _ - only"
+
+    if printf '%s\n' $AGENTS | grep -q "^${name}:"; then
+        die "'$name' is already in demo.conf"
+    fi
+
+    # With --source the agent registers carrying the recorded machine's identity from its VERY
+    # FIRST message. The manager appears to keep what it learned at registration, so fixing the
+    # identity afterwards does not reliably change the header or the stamp on events.
+    local identity_flag=()
+    if [ -n "$source" ]; then
+        [[ "$source" =~ ^[0-9]+$ ]] \
+            || die "--source must be a recorded agent id (digits). See: ./democtl agent sources"
+        [ -d "${HERE}/fixtures/docs" ] || die "no fixtures in ${HERE}/fixtures"
+        head_ "Checking source $source for a $profile agent"
+        local rc=0
+        fixture_tool check "$source" "$profile" || rc=$?
+        [ $rc -eq 0 ] || die "nothing was enrolled: source $source does not fit (see above)"
+        if [ -z "$hostname" ]; then
+            hostname=$(default_hostname "$profile")
+            local e
+            for e in ${REMAP:-}; do
+                if [ "${e##*:}" = "$hostname" ]; then hostname="${hostname}-${name}"; break; fi
+            done
+        fi
+        "$PYTHON" "${HERE}/wazuh_identity.py" --fixtures "${HERE}/fixtures/docs" \
+            --source "$source" --profile "$profile" --hostname "$hostname" \
+            --out "${STATE}/${name}.identity" \
+            || warn "no identity derived from source $source; registering with the default profile"
+        [ -f "${STATE}/${name}.identity" ] && identity_flag=(--identity "${STATE}/${name}.identity")
+    fi
+
+    head_ "Adding agent '$name'"
+    printf '  enrolling %s (%s, %s)...\n' "$name" "$profile" "$ip"
+    if ! "$PYTHON" "${HERE}/wazuh_agent_sim.py" \
+          --manager "$MANAGER" --profile "$profile" \
+          --name "$name" --reported-ip "$ip" \
+          --password-file "$ENROLL_PASS_FILE" \
+          --state "${STATE}/${name}.json" ${identity_flag[@]+"${identity_flag[@]}"} \
+          --once >>"${LOGS}/enroll.log" 2>&1; then
+        bad "enrollment failed — see ${LOGS}/enroll.log"
+        tail -5 "${LOGS}/enroll.log" | sed 's/^/      /'
+        rm -f "${STATE}/${name}.identity"
+        return 1
+    fi
+    local aid; aid=$(grep -o '"id"[^,]*' "${STATE}/${name}.json" | cut -d'"' -f4)
+    ok "enrolled as agent $aid"
+
+    # Append to the AGENTS block in demo.conf, same shape democtl already parses.
+    python3 - "$CONF" "$name" "$profile" "$ip" <<'PYEOF'
+import re, sys, pathlib
+conf, name, profile, ip = sys.argv[1:5]
+text = pathlib.Path(conf).read_text()
+m = re.search(r'^AGENTS="\n?(.*?)"', text, re.S | re.M)
+block = (m.group(1).rstrip("\n") if m else "")
+block = (block + "\n" if block else "") + f"{name}:{profile}:{ip}"
+new_block = f'AGENTS="\n{block}\n"'
+if m:
+    text = text[:m.start()] + new_block + text[m.end():]
+else:
+    text += f'\n{new_block}\n'
+pathlib.Path(conf).write_text(text)
+PYEOF
+    ok "added to demo.conf"
+    if [ -n "$source" ]; then
+        # shellcheck disable=SC1090
+        source "$CONF"
+        cmd_agent_map "$name" "$source" --hostname "$hostname"
+    else
+        echo "  Give it data:  ./democtl agent sources              # what was recorded"
+        echo "                 ./democtl agent map $name <source-id>   # also starts it"
+        echo "  (or add it with --source next time, so it registers with the right identity at once)"
+    fi
+}
+
+cmd_agent_list() {
+    head_ "Configured agents"
+    for entry in $AGENTS; do
+        local name profile ip aid status
+        name=${entry%%:*}
+        profile=$(agent_profile "$entry")
+        ip=$(agent_ip "$entry")
+        if [ -f "${STATE}/${name}.json" ]; then
+            aid=$(grep -o '"id"[^,]*' "${STATE}/${name}.json" | cut -d'"' -f4)
+        else
+            aid="(not enrolled)"
+        fi
+        if is_running "$name"; then status="running"; else status="stopped"; fi
+        printf '  %-20s %-8s %-16s id=%-6s %s\n' "$name" "$profile" "$ip" "$aid" "$status"
+    done
+}
+
+fixture_tool() {  # list | check <source-id> <profile>
+    "$PYTHON" - "${HERE}/fixtures/docs" "$@" <<'PYEOF'
+import json, sys
+from collections import Counter
+from pathlib import Path
+
+docs, mode = Path(sys.argv[1]), sys.argv[2]
+
+
+def read(fname):
+    f = docs / fname
+    if not f.exists():
+        return
+    with f.open() as fh:
+        for line in fh:
+            try:
+                yield json.loads(line)["_source"]
+            except (ValueError, KeyError, TypeError):
+                continue
+
+
+def aid_of(src):
+    return str(((src.get("wazuh") or {}).get("agent") or {}).get("id") or "")
+
+
+def fit_of(platform, name):
+    t = f"{platform or ''} {name or ''}".lower()
+    if "windows" in t:
+        return "windows"
+    if "darwin" in t or "macos" in t or "mac os" in t:
+        return "macos"
+    return "linux"
+
+
+def count(fname):
+    c = Counter()
+    for src in read(fname):
+        if aid_of(src):
+            c[aid_of(src)] += 1
+    return c
+
+
+info = {}
+for src in read("wazuh-states-inventory-system.jsonl"):
+    a = aid_of(src)
+    if not a:
+        continue
+    os_ = (src.get("host") or {}).get("os") or {}
+    name = os_.get("name") or "?"
+    ver = os_.get("version") or ""
+    info[a] = {"os": f"{name} {ver}".strip(), "fit": fit_of(os_.get("platform"), name)}
+
+pk = count("wazuh-states-inventory-packages.jsonl")
+vd = count("wazuh-states-vulnerabilities.jsonl")
+sca = count("wazuh-states-sca.jsonl")
+fim = count("wazuh-states-fim-files.jsonl")
+
+
+def row(a):
+    flag = "" if vd[a] else "   <- no vulnerability data"
+    return (f"  {a:<7} {info[a]['fit']:<8} {pk[a]:>8} {vd[a]:>7} {sca[a]:>6} {fim[a]:>7}   "
+            f"{info[a]['os']}{flag}")
+
+
+HEAD = f"  {'source':<7} {'fits':<8} {'packages':>8} {'vulns':>7} {'SCA':>6} {'FIM':>7}   OS"
+
+if mode == "list":
+    if not info:
+        print("  no system inventory records found in the fixtures")
+        sys.exit(4)
+    print(HEAD)
+    for a in sorted(info):
+        print(row(a))
+    sys.exit(0)
+
+src, want = sys.argv[3], sys.argv[4]
+if src not in info:
+    print(f"  no recorded source '{src}'. Recorded: " + ", ".join(sorted(info)))
+    sys.exit(4)
+print(f"  {src}: {info[src]['os']}   ({pk[src]} packages, {vd[src]} vulnerabilities, "
+      f"{sca[src]} SCA checks, {fim[src]} FIM files)")
+if info[src]["fit"] != want:
+    print(f"  MISMATCH: source {src} is a {info[src]['fit']} machine, this agent is {want}.")
+    print(f"  Sources that fit a {want} agent:")
+    print(HEAD)
+    for a in sorted(info):
+        if info[a]["fit"] == want:
+            print(row(a))
+    sys.exit(3)
+if not vd[src]:
+    print("  note: this source has no vulnerability data, so the agent's Vulnerability "
+          "Detection panel will be empty.")
+sys.exit(0)
+PYEOF
+}
+
+cmd_agent_sources() {
+    [ -d "${HERE}/fixtures/docs" ] \
+        || die "no fixtures in ${HERE}/fixtures -- import a bundle or record some first"
+    head_ "Recorded sources"
+    fixture_tool list || exit 1
+    echo
+    echo "  Map one with:  ./democtl agent map <agent> <source-id>"
+    echo "  'fits' says which kind of agent can use a source; map refuses a mismatch."
+}
+
+cmd_agent_map() {
+    local name=${1:-} source=${2:-} force=no hostname=""
+    # Check the arguments exist BEFORE shifting: with fewer than two, `shift 2` fails and
+    # shifts nothing, and the agent name would then be parsed as an option.
+    [ -n "$name" ] && [ -n "$source" ] || die "usage: ./democtl agent map <name> <source-id> [--hostname H] [--force]
+    ./democtl agent sources    lists what was recorded"
+    shift 2
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=yes ;;
+            --hostname) hostname=${2:-}; shift ;;
+            *) die "unknown option '$1'" ;;
+        esac
+        shift
+    done
+    [[ "$source" =~ ^[0-9]+$ ]] \
+        || die "'$source' is not a source id (digits, e.g. 004). See: ./democtl agent sources"
+    [ -d "${HERE}/fixtures/docs" ] || die "no fixtures in ${HERE}/fixtures"
+
+    local entry
+    entry=$(printf '%s\n' $AGENTS | grep "^${name}:") || true
+    [ -n "$entry" ] || die "no such agent '$name' in demo.conf. Known: $(agent_names | tr '\n' ' ')"
+    [ -f "${STATE}/${name}.json" ] || die "$name is not enrolled yet -- run ./democtl start"
+    local profile newid
+    profile=$(agent_profile "$entry")
+    newid=$(grep -o '"id"[^,]*' "${STATE}/${name}.json" | cut -d'"' -f4)
+
+    head_ "Mapping '$name' (agent $newid, $profile) to recorded source $source"
+    local rc=0
+    fixture_tool check "$source" "$profile" || rc=$?
+    if [ $rc -eq 4 ]; then
+        die "nothing changed"
+    elif [ $rc -eq 3 ] && [ "$force" != yes ]; then
+        die "refusing: wrong kind of source. (--force overrides, if you really mean it.)"
+    elif [ $rc -ne 0 ] && [ $rc -ne 3 ]; then
+        die "could not read the fixtures (exit $rc)"
+    fi
+
+    local entryline
+    entryline=$(python3 - "$CONF" "$source" "$newid" "$name" "$profile" "$hostname" <<'PYEOF'
+import re, sys, pathlib
+conf, source, newid, name, profile, host = sys.argv[1:7]
+text = pathlib.Path(conf).read_text()
+default = {"windows": "WIN-DEMO", "linux": "amazonlinux-demo",
+           "macos": "MAC-demo-MacBook-Air.local"}[profile]
+
+m = re.search(r'^REMAP="([^"]*)"', text, re.M)
+entries = m.group(1).split() if m else []
+
+
+def mine(e):
+    p = e.split(":")
+    return (len(p) >= 2 and p[1] == newid) or (len(p) >= 3 and p[2] == name)
+
+
+# An agent being re-mapped keeps the hostname it already has: the manager recorded that one when
+# the agent registered, and the inventory should keep agreeing with it.
+prev = next((e.split(":")[3] for e in entries if mine(e) and len(e.split(":")) >= 4), "")
+entries = [e for e in entries if not mine(e)]          # re-mapping replaces, never duplicates
+
+used = {e.split(":")[3] for e in entries if len(e.split(":")) >= 4}
+if not host:
+    host = prev or default
+    if host in used:                                    # two agents, one hostname: make it unique
+        host = f"{host}-{name}"                         # by NAME, the same rule `agent add` uses
+entries.append(f"{source}:{newid}:{name}:{host}")
+new_remap = 'REMAP="' + " ".join(entries) + '"'
+text = (text[:m.start()] + new_remap + text[m.end():]) if m else text + "\n" + new_remap + "\n"
+
+# FIXTURE_AGENTS = exactly the sources REMAP uses. A source with no REMAP entry would
+# replay onto the original real agent.
+sources = list(dict.fromkeys(e.split(":")[0] for e in entries))
+line = 'FIXTURE_AGENTS="' + " ".join(sources) + '"'
+m2 = re.search(r'^FIXTURE_AGENTS="[^"]*"', text, re.M)
+text = (text[:m2.start()] + line + text[m2.end():]) if m2 else text + "\n" + line + "\n"
+pathlib.Path(conf).write_text(text)
+print(f"  REMAP entry: {source}:{newid}:{name}:{host}")
+PYEOF
+)
+    echo "$entryline"
+    ok "demo.conf updated"
+
+    # The agent has to REPORT the machine its inventory came from. Otherwise the header and
+    # every event are stamped with the built-in profile (Windows 11 Pro, macOS 26.7, Amazon
+    # Linux) while the inventory shows a different machine.
+    "$PYTHON" "${HERE}/wazuh_identity.py" --fixtures "${HERE}/fixtures/docs" \
+        --source "$source" --profile "$profile" --hostname "${entryline##*:}" \
+        --out "${STATE}/${name}.identity" \
+        || warn "no identity derived; $name keeps its built-in profile"
+
+    # Re-read the config, restart the replay on the new mapping, and bring up whatever is
+    # not running yet (keepalives for the new agent).
+    # shellcheck disable=SC1090
+    source "$CONF"
+    stop_proc replay
+    # Restart its keepalive so it reports the new identity, with a CLEAN disconnect in between so
+    # the manager sees a fresh start rather than one unbroken session with a changed body.
+    local was_running=no
+    is_running "$name" && was_running=yes
+    stop_proc "$name"
+    if [ "$was_running" = yes ]; then
+        if "$PYTHON" "${HERE}/wazuh_agent_sim.py" --manager "$MANAGER" --profile "$profile" \
+              --state "${STATE}/${name}.json" --shutdown >>"${LOGS}/${name}.log" 2>&1; then
+            ok "$name disconnected cleanly"
+        else
+            warn "could not send a clean shutdown for $name"
+        fi
+        sleep 3
+    fi
+    cmd_start
+    echo
+    echo "  Inventory, vulnerabilities and SCA appear within a couple of minutes."
+    echo "  The agent now reports the recorded machine's OS. Events sent from now on carry it;"
+    echo "  ones already in the index keep the old stamp."
+}
+
+cmd_agent_remove() {
+    local name=$1
+    [ -n "$name" ] || die "usage: ./democtl agent remove <name>"
+    printf '%s\n' $AGENTS | grep -q "^${name}:" || die "no such agent '$name' in demo.conf"
+
+    head_ "Removing '$name'"
+    stop_proc "$name" 2>/dev/null
+    stop_proc "${name}-events" 2>/dev/null
+
+    local aid
+    if [ -f "${STATE}/${name}.json" ]; then
+        aid=$(grep -o '"id"[^,]*' "${STATE}/${name}.json" | cut -d'"' -f4)
+        if [ -n "${API_PASS:-}" ] && [ -n "$aid" ]; then
+            local token
+            token=$(curl -sk -u "${API_USER}:${API_PASS}" -X POST \
+                    "https://${MANAGER}:55000/security/user/authenticate?raw=true" 2>/dev/null)
+            if [ -n "$token" ]; then
+                curl -sk -H "Authorization: Bearer $token" -X DELETE \
+                  "https://${MANAGER}:55000/agents?agents_list=${aid}&status=all&older_than=0s" \
+                  >/dev/null 2>&1 && ok "removed agent $aid from the manager"
+            fi
+        fi
+    fi
+    rm -f "${STATE}/${name}.json" "${STATE}/${name}.identity"
+
+    python3 - "$CONF" "$name" "${aid:-}" <<'PYEOF'
+import re, sys, pathlib
+conf, name, aid = sys.argv[1:4]
+text = pathlib.Path(conf).read_text()
+
+m = re.search(r'^AGENTS="\n?(.*?)"', text, re.S | re.M)
+if m:
+    kept = [l for l in m.group(1).splitlines() if l.strip() and not l.startswith(f"{name}:")]
+    text = text[:m.start()] + 'AGENTS="\n' + "\n".join(kept) + '\n"' + text[m.end():]
+
+# REMAP entries are SOURCE:NEW:NAME:HOST. Drop the ones for this agent, by id or by name.
+m = re.search(r'^REMAP="([^"]*)"', text, re.M)
+if m:
+    entries = m.group(1).split()
+    def is_mine(e):
+        p = e.split(":")
+        return (len(p) >= 2 and aid and p[1] == aid) or (len(p) >= 3 and p[2] == name)
+    kept = [e for e in entries if not is_mine(e)]
+    if len(kept) != len(entries):
+        text = text[:m.start()] + 'REMAP="' + " ".join(kept) + '"' + text[m.end():]
+        # FIXTURE_AGENTS must list exactly the sources still in REMAP. A source left
+        # there with no REMAP entry would replay onto the ORIGINAL real agent.
+        used = list(dict.fromkeys(e.split(":")[0] for e in kept))
+        m2 = re.search(r'^FIXTURE_AGENTS="([^"]*)"', text, re.M)
+        if m2:
+            text = text[:m2.start()] + 'FIXTURE_AGENTS="' + " ".join(used) + '"' + text[m2.end():]
+pathlib.Path(conf).write_text(text)
+PYEOF
+    ok "removed from demo.conf"
+
+    # The running replay still carries the old mapping. Restart it on the new one.
+    if is_running replay; then
+        # shellcheck disable=SC1090
+        source "$CONF"
+        stop_proc replay
+        start_replay
+    fi
+}
+
+cmd_export() {
+    local out=${1:-wazuh-demo-export-$(date +%Y%m%d-%H%M%S).tar.gz}
+    head_ "Exporting the full environment"
+    echo "  Captures: agent definitions, what each is currently doing (mirroring"
+    echo "  a real agent, running a scenario, or idle), inventory mappings,"
+    echo "  recorded fixtures, and the harvested event corpus."
+    echo "  Does NOT include: agent credentials (cryptographic keys tied to"
+    echo "  THIS manager — the target re-enrolls and gets its own), or the"
+    echo "  documents already sitting in this manager's indexer (those were"
+    echo "  produced by replay from the fixtures/corpus being exported, so"
+    echo "  replaying the same material on the target reproduces them)."
+    echo
+
+    local tmp; tmp=$(mktemp -d)
+    mkdir -p "${tmp}/bundle"
+    [ -d "${HERE}/fixtures" ] && cp -r "${HERE}/fixtures" "${tmp}/bundle/"
+    [ -d "${HERE}/events" ] && cp -r "${HERE}/events" "${tmp}/bundle/"
+    [ -f "$CONF" ] && sed -E 's/^(API_PASS|UI_PASS)=.*/\1=/' "$CONF" \
+        > "${tmp}/bundle/demo.conf.exported"
+
+    # What each agent is DOING right now: read it straight from the running
+    # process's own argv, not a side file that could drift from reality.
+    "$PYTHON" - "$tmp" <<'PYEOF'
+import json, re, sys
+from pathlib import Path
+
+tmp = Path(sys.argv[1])
+here = Path(__file__).resolve().parent if "__file__" in dir() else Path(".")
+
+def read_cmdline(pid: str) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return [p for p in raw.decode(errors="replace").split("\x00") if p]
+    except OSError:
+        return []
+
+def running_pid(name: str) -> str | None:
+    pf = Path("run") / f"{name}.pid"
+    if not pf.exists():
+        return None
+    pid = pf.read_text().strip()
+    return pid if Path(f"/proc/{pid}").exists() else None
+
+def arg_after(argv: list[str], flag: str) -> str | None:
+    return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+
+conf_text = Path("demo.conf").read_text() if Path("demo.conf").exists() else ""
+m = re.search(r'^AGENTS="\n?(.*?)"', conf_text, re.S | re.M)
+agent_lines = [l for l in (m.group(1).splitlines() if m else []) if l.strip()]
+
+snapshot = {"agents": []}
+for line in agent_lines:
+    parts = line.split(":")
+    if len(parts) < 3:
+        continue
+    name, profile, ip = parts[0], parts[1], parts[2]
+    entry = {"name": name, "profile": profile, "ip": ip, "activity": None}
+
+    ev_pid = running_pid(f"{name}-events")
+    if ev_pid:
+        argv = read_cmdline(ev_pid)
+        if "--mirror" in argv:
+            entry["activity"] = {"type": "mirror",
+                                 "source_id": arg_after(argv, "--mirror")}
+        elif "--scenario" in argv:
+            entry["activity"] = {"type": "ambient",
+                                 "scenario": arg_after(argv, "--scenario")}
+    snapshot["agents"].append(entry)
+
+(tmp / "bundle" / "activity.json").write_text(json.dumps(snapshot, indent=2))
+print(f"captured activity for {len(snapshot['agents'])} agent(s)")
+PYEOF
+
+    tar -C "${tmp}/bundle" -czf "$out" .
+    rm -rf "$tmp"
+    ok "wrote $out"
+    echo
+    echo "  On the target host:"
+    echo "    cd /opt/wazuh-demo"
+    echo "    ./democtl import $(basename "$out")"
+    echo "  (that one command re-enrolls every agent, reproduces its mirror or"
+    echo "   scenario, maps inventory, and starts the replay — see the import"
+    echo "   summary it prints for exactly what it did)"
+}
+
+cmd_import() {
+    local bundle=$1
+    [ -n "$bundle" ] && [ -f "$bundle" ] || die "usage: ./democtl import <bundle.tar.gz>"
+    [ -f "$CONF" ] || die "run ./democtl setup first — import needs a manager to enrol against"
+
+    head_ "Importing $bundle"
+    local tmp; tmp=$(mktemp -d)
+    tar xzf "$bundle" -C "$tmp"
+
+    if [ -d "${tmp}/fixtures" ]; then
+        cp -r "${tmp}/fixtures" "${HERE}/"
+        ok "imported fixtures/"
+    fi
+    if [ -d "${tmp}/events" ]; then
+        cp -r "${tmp}/events" "${HERE}/"
+        ok "imported events/"
+    fi
+
+    [ -f "${tmp}/activity.json" ] || { rm -rf "$tmp"; die "not a full export (no activity.json) — old-style bundle?"; }
+
+    head_ "Recreating agents"
+    # shellcheck disable=SC2016
+    local agent_count; agent_count=$(python3 -c 'import json,sys;print(len(json.load(open(sys.argv[1]))["agents"]))' "${tmp}/activity.json")
+    info_line() { printf '  %s\n' "$*"; }
+    local i name profile ip
+    for i in $(seq 0 $((agent_count - 1))); do
+        name=$(python3 -c "import json;print(json.load(open('${tmp}/activity.json'))['agents'][$i]['name'])")
+        profile=$(python3 -c "import json;print(json.load(open('${tmp}/activity.json'))['agents'][$i]['profile'])")
+        ip=$(python3 -c "import json;print(json.load(open('${tmp}/activity.json'))['agents'][$i]['ip'])")
+
+        if printf '%s\n' $AGENTS | grep -q "^${name}:"; then
+            warn "$name already in demo.conf — skipping add, will still sync activity"
+        else
+            cmd_agent_add "$name" "$profile" "$ip" || warn "$name enrollment failed, skipping"
+        fi
+    done
+
+    # Reload AGENTS after cmd_agent_add's writes.
+    # shellcheck disable=SC1090
+    source "$CONF"
+
+    head_ "Starting keepalives and inventory replay"
+    cmd_start
+
+    head_ "Reproducing activity"
+    for i in $(seq 0 $((agent_count - 1))); do
+        name=$(python3 -c "import json;print(json.load(open('${tmp}/activity.json'))['agents'][$i]['name'])")
+        local atype srcid scen
+        atype=$(python3 -c "
+import json
+a = json.load(open('${tmp}/activity.json'))['agents'][$i]
+print((a.get('activity') or {}).get('type') or '')")
+        case "$atype" in
+            mirror)
+                srcid=$(python3 -c "
+import json
+a = json.load(open('${tmp}/activity.json'))['agents'][$i]
+print(a['activity']['source_id'])")
+                warn "$name was mirroring real agent $srcid on the SOURCE manager."
+                warn "  That agent id will not exist here. Start mirroring a real"
+                warn "  agent on THIS manager instead:"
+                echo "    ./democtl events $name <this-manager-agent-id> (via UI: Mirror a real agent)"
+                ;;
+            ambient)
+                scen=$(python3 -c "
+import json
+a = json.load(open('${tmp}/activity.json'))['agents'][$i]
+print(a['activity']['scenario'])")
+                cmd_events "$name" "$scen" >/dev/null 2>&1 \
+                    && ok "$name: resumed '$scen'" \
+                    || warn "$name: could not resume '$scen'"
+                ;;
+            *) ;;
+        esac
+    done
+    rm -rf "$tmp"
+
+    echo
+    ok "import complete"
+    echo "  Next: set each agent's inventory source (UI -> Inventory button, or"
+    echo "  edit REMAP/FIXTURE_AGENTS in demo.conf) using the agent ids from"
+    echo "  fixtures/manifest.json, which transferred with the fixtures."
+    echo "  ./democtl status shows the current state of everything above."
+}
+
+cmd_events() {
+    local name=$1 scenario=$2
+    [ -n "$name" ] && [ -n "$scenario" ] \
+        || die "usage: ./democtl events <agent-name> <scenario>
+    scenarios: ambient security-alerts brute-force privilege-escalation session-activity fim-changes
+               rule:<text>   events harvested for a detection (harvester --rule)"
+
+    local entry profile
+    entry=$(printf '%s\n' $AGENTS | grep "^${name}:")
+    [ -n "$entry" ] || die "no such agent '$name' in demo.conf"
+    profile=$(echo "$entry" | cut -d: -f2)
+    [ -f "${STATE}/${name}.json" ] || die "$name is not enrolled — run ./democtl start first"
+
+    if [ "$scenario" = "fim-changes" ]; then
+        cmd_fim "$name"
+        return
+    fi
+
+    head_ "Sending '$scenario' to $name"
+    "$PYTHON" "${HERE}/wazuh_event_player.py" \
+        --manager "$MANAGER" --state "${STATE}/${name}.json" \
+        --events "${HERE}/events" --profile "$profile" --name "$name" \
+        --scenario "$scenario" --once
+}
+
+usage() {
+    sed -n '3,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+case "${1:-}" in
+    setup)     cmd_setup ;;
+    install)   cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    restart) cmd_stop; sleep 2; cmd_start ;;
+    status)  cmd_status ;;
+    logs)    cmd_logs ;;
+    enroll)  cmd_enroll ;;
+    purge)   cmd_purge ;;
+    fim)     cmd_fim "${2:-}" ;;
+    events)  cmd_events "${2:-}" "${3:-}" ;;
+    agent)   shift; cmd_agent "$@" ;;
+    reload)  cmd_reload ;;
+    export)  cmd_export "${2:-}" ;;
+    import)  cmd_import "${2:-}" ;;
+    *)       usage ;;
+esac

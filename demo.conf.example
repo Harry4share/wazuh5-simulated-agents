@@ -1,0 +1,68 @@
+# demo.conf — everything democtl needs. Edit this, not the scripts.
+#
+# Copy to demo.conf and adjust. Sourced as bash, so no spaces around '='.
+
+# ---------------------------------------------------------------- manager ---
+MANAGER=10.0.44.61
+
+# ----------------------------------------------------------------- agents ---
+# Leave AGENTS, FIXTURE_AGENTS and REMAP EMPTY on a new install. Create agents with
+#   ./democtl agent add <name> <macos|windows|linux> <reported-ip> --source <recorded id>
+# which enrols the agent, gives it the identity of the recorded machine, and writes all
+# three of these lines for you. (List the recorded ids with ./democtl agent sources.)
+#
+# AGENTS entries are  name:profile:reported_ip
+AGENTS=""
+
+# Recorded agent ids to replay. They are the ids of the REAL agents the fixtures were
+# recorded from, and must be exactly the sources REMAP uses.
+FIXTURE_AGENTS=""
+
+# SOURCE:NEW[:NAME[:HOSTNAME]] pairs, linking a recorded agent to a simulated one.
+REMAP=""
+
+# Seconds between replay passes. 300 keeps scan times looking current.
+REPLAY_INTERVAL=300
+
+# ---------------------------------------------------------------- enrolment ---
+# File holding the manager's enrolment password. On the manager host this is the path
+# below. On a SEPARATE simulator host that file does not exist: copy
+# /var/wazuh-manager/etc/authd.pass from the manager (mode 600) and point this at the copy.
+ENROLL_PASS_FILE=/var/wazuh-manager/etc/authd.pass
+
+# Include file-integrity state (files, registry) in the replay. Needed for the File
+# Integrity Monitoring panels to have data; it is the bulk of the documents each pass.
+INCLUDE_FIM=yes
+
+# ------------------------------------------------------------- optional -----
+# Manager API credentials. Only used by './democtl status' to show what the
+# manager thinks. Leave blank to skip that section.
+API_USER=wazuh-wui
+API_PASS=
+
+# Mark agents disconnected on stop rather than letting them time out.
+CLEAN_SHUTDOWN=yes
+
+# ------------------------------------------------------------- web UI ------
+# The UI starts with ./democtl start and is reachable on the network.
+UI_ENABLED=yes
+UI_PORT=8088
+UI_BIND=127.0.0.1        # 0.0.0.0 to serve the network; then set UI_PASS below
+
+# STRONGLY RECOMMENDED when UI_BIND is not 127.0.0.1. The UI can enrol agents,
+# stop processes and delete data, so leaving it open on a routable address is
+# the same as leaving those controls open. Blank disables authentication.
+UI_USER=demo
+UI_PASS=
+
+# PYTHON=python3
+
+# ---- Automatic events -------------------------------------------------------
+# Dashboards default to the last 24 hours and a replayed event is stamped with the
+# time it was sent, so anything sent once ages out. With AUTO_EVENTS=yes,
+# ./democtl start also runs a scheduler that keeps sending each scenario on its own
+# cadence (a warm-up burst at first start, then a steady trickle), for every agent in
+# AGENTS, so the dashboard always has recent events and findings.
+AUTO_EVENTS=yes
+# light = half as often, normal, busy = twice as often
+AUTO_EVENTS_LEVEL=normal
