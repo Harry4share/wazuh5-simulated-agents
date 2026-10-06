@@ -23,8 +23,12 @@ instead of arriving in bursts. On first start every job runs once within a coupl
 minutes (a warm-up), so alerts appear right after install. The schedule is kept in
 run/autoevents.json, so a restart or reboot does not cause a burst.
 
-A scenario a platform has nothing for (sudo lines on a Mac, say) is recorded as empty and
-retried only every 12 hours. A failure backs off, 1 minute doubling to 30.
+Three kinds of "no", handled differently:
+  empty   the corpus has no lines for that scenario on that platform (sudo lines on a Mac).
+          Retried every 12 hours, and at once when the corpus changes (you seed or harvest).
+  retry   lines exist but every random draw was rejected as implausible or unparseable.
+          Tried again soon: 5 minutes, doubling to 2 hours, reset by the next success.
+  fail    a real error (manager unreachable, 401, ...). 1 minute, doubling to 30.
 
 Agents are read from demo.conf on every pass, so adding or removing one needs no restart.
 
@@ -70,6 +74,7 @@ JOBS = [
 ]
 RULE_MINUTES = 240
 EMPTY_BACKOFF = 12 * 3600
+RETRY_FIRST, RETRY_MAX = 5 * 60, 2 * 3600
 FAIL_BACKOFF_FIRST, FAIL_BACKOFF_MAX = 60, 30 * 60
 JITTER = 0.25
 WARMUP_STEP = 4                    # seconds between jobs at first start
@@ -118,6 +123,19 @@ def rule_scenarios(events_dir: Path, platform: str) -> list[str]:
     return out
 
 
+def corpus_stamp(events_dir: Path, platform: str) -> str:
+    """Changes when a group file for this platform is added, removed or rewritten."""
+    d = events_dir / "events"
+    files = sorted(d.glob(f"{platform}-*.jsonl")) if d.is_dir() else []
+    newest = 0.0
+    for f in files:
+        try:
+            newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            pass
+    return f"{len(files)}:{int(newest)}"
+
+
 def jobs_for(platform: str, events_dir: Path) -> list[tuple[str, int, list[str]]]:
     jobs = [(s, m * 60, extra) for s, m, plats, extra in JOBS if platform in plats]
     jobs += [(s, RULE_MINUTES * 60, []) for s in rule_scenarios(events_dir, platform)]
@@ -159,16 +177,24 @@ def ensure(state: dict, key: str, now: float, order: int, level: str, base: int,
 
 
 def record(state: dict, key: str, outcome: str, note: str, now: float, base: int,
-           level: str, scale: float) -> None:
+           level: str, scale: float, corpus: str | None = None) -> None:
     st = state[key]
     st["last"], st["result"], st["note"] = now, outcome, note
+    if corpus is not None:
+        st["corpus"] = corpus
     if outcome == "ok":
         st["ok"] += 1
         st["fails_in_row"] = 0
+        st["retries_in_row"] = 0
         st["next"] = now + jittered(interval(base, level, scale))
     elif outcome == "empty":
         st["empty"] += 1
         st["next"] = now + EMPTY_BACKOFF / scale
+    elif outcome == "retry":
+        st["retry"] = st.get("retry", 0) + 1
+        st["retries_in_row"] = st.get("retries_in_row", 0) + 1
+        back = min(RETRY_FIRST * 2 ** (st["retries_in_row"] - 1), RETRY_MAX)
+        st["next"] = now + back / scale
     else:
         st["fail"] += 1
         st["fails_in_row"] = st.get("fails_in_row", 0) + 1
@@ -193,6 +219,9 @@ def run_job(manager: str, name: str, profile: str, scenario: str, extra: list[st
         m = re.search(r"(\d+)[^\n]*accepted", out)
         return "ok", f"{m.group(1)} accepted" if m else "sent"
     if "nothing to send" in out:
+        if "rejected as implausible" in out:
+            # Lines exist, but every one drawn this time was rejected. A different draw may pass.
+            return "retry", "every line drawn was rejected as implausible or unparseable; will draw again"
         return "empty", "nothing in the corpus for this platform"
     last = out.splitlines()[-1].strip() if out else f"exit {r.returncode}"
     return "fail", last[:140]
@@ -286,6 +315,7 @@ def main() -> int:
             log("MANAGER is not set in demo.conf; nothing to do")
         now = clock()
 
+        stamps = {profile: corpus_stamp(events, profile) for _, profile in usable}
         plan = []                                    # (key, name, profile, scenario, base, extra)
         order = 0
         per_agent = [(name, profile, jobs_for(profile, events)) for name, profile in usable]
@@ -299,8 +329,16 @@ def main() -> int:
                 key = f"{name}|{scenario}"
                 plan.append((key, name, profile, scenario, base, extra))
                 ensure(state, key, now, order, level, base, scale)
+                st = state[key]
+                if st.get("result") in ("empty", "retry") and st.get("corpus") != stamps[profile]:
+                    # The corpus changed since this job found nothing: look again now, not in hours.
+                    # (A schedule written by an older version has no stamp, which also counts as
+                    # changed: one extra look at upgrade is cheap, and it wakes jobs that went to
+                    # sleep for 12 hours before the corpus was filled.)
+                    st["next"] = min(st["next"], now + rng.uniform(2, 30) / scale)
+                    st["corpus"] = stamps[profile]
                 if args.once:
-                    state[key]["next"] = now
+                    st["next"] = now
                 order += 1
 
         due = sorted((p for p in plan if state[p[0]]["next"] <= now), key=lambda p: state[p[0]]["next"])
@@ -311,7 +349,7 @@ def main() -> int:
                 print(f"would send {scenario:<44} to {name} ({profile})")
                 continue
             outcome, note = run_job(conf["manager"], name, profile, scenario, extra, events)
-            record(state, key, outcome, note, clock(), base, level, scale)
+            record(state, key, outcome, note, clock(), base, level, scale, stamps[profile])
             log(f"{name} {scenario} {outcome} {note}")
             save_state(state_file, state)
             time.sleep(args.pause / scale)

@@ -296,6 +296,19 @@ def main() -> int:
     for group, bodies in sorted(groups.items()):
         action = group.split("-", 1)[1]
         path = evdir / f"{group}.jsonl"
+        if args.merge and path.exists():
+            # Replace only OUR earlier lines (flagged synthetic), so a re-run does not pile up
+            # duplicates and a harvested group of the same name keeps every real line.
+            kept = []
+            for ln in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    if json.loads(ln).get("synthetic"):
+                        continue
+                except ValueError:
+                    pass
+                if ln.strip():
+                    kept.append(ln)
+            path.write_text("".join(k + "\n" for k in kept), encoding="utf-8")
         with path.open("a" if args.merge else "w", encoding="utf-8") as fh:
             for body in bodies:
                 # Player strips the envelope and rebuilds it per platform, so a
